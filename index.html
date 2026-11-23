@@ -109,6 +109,8 @@
 
 <div class="grid" id="grid"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>  
+  
 <script>
 // МАССИВ МАШИН (667 автомобилей)
 const cars = [
@@ -283,7 +285,6 @@ const LOCAL_PHOTO_FOLDER = 'images/';
 const LOCAL_EXTENSIONS = ['png','webp','jpg','jpeg'];
 
 let prices = {};
-try { prices = JSON.parse(localStorage.getItem(PRICE_KEY) || '{}'); } catch(e){ prices = {}; }
 let sortMode = 'none';
 let pricedOnly = false;
 let wikiPhotoMap = new Map();
@@ -295,9 +296,7 @@ const exportBtn = $('exportBtn'), importBtn = $('importBtn'), importFile = $('im
 const clearBtn = $('clearBtn'), clearPhotoCacheBtn = $('clearPhotoCacheBtn');
 const totalCarsEl = $('totalCars');
 totalCarsEl.textContent = cars.length;
-function savePrices(){ try { localStorage.setItem(PRICE_KEY, JSON.stringify(prices)); } catch(e){} }
 function getPrice(name){ return Object.prototype.hasOwnProperty.call(prices,name) ? prices[name] : null; }
-function setPrice(name,value){ if(value===''||value===null||isNaN(value)) delete prices[name]; else prices[name]=Number(value); savePrices(); }
 function totalPriced(){ return Object.keys(prices).length; }
 function parseCar(name){ const m=name.match(/^(\d{3,4})\s+(.*)$/); return {year:m?m[1]:'',title:m?m[2]:name}; }
 function escapeHtml(s){ return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -460,18 +459,45 @@ function render(){
                value="${price !== null ? price : ''}">
       </div>
     `;
-    const input = body.querySelector('.price-input');
-    input.addEventListener('input', () => {
-      setPrice(name, input.value);
-      card.classList.toggle('priced', getPrice(name) !== null);
-      countEl.textContent = `Показано: ${list.length} · С ценой: ${totalPriced()} из ${cars.length}`;
-    });
-    input.addEventListener('blur', () => {
-      const p = getPrice(name);
-      input.value = p !== null ? p : '';
-      if(sortMode !== 'none' || pricedOnly) render();
-    });
-    input.addEventListener('keydown', e => { if(e.key === 'Enter') input.blur(); });
+   const input = body.querySelector('.price-input');
+    input.dataset.carId = name;
+    input.readOnly = !canEditPrices();
+
+input.addEventListener('change', () => {
+  if (!canEditPrices()) return;
+
+  const value = input.value;
+  if (input.validity.badInput || (value !== '' && !validPrice(Number(value)))) {
+    input.value = getPrice(name) ?? '';
+    alert('Введи целую неотрицательную цену до 2 147 483 647.');
+    return;
+  }
+
+  runPriceAction(async () => {
+    if (value === '') {
+      await checkPriceRequest(
+        priceDb.from('car_prices').delete().eq('car_id', name)
+      );
+      delete prices[name];
+      return 'Цена удалена.';
+    }
+
+    const price = Number(value);
+    await checkPriceRequest(
+      priceDb.from('car_prices').upsert(
+        { car_id: name, price },
+        { onConflict: 'car_id' }
+      )
+    );
+    prices[name] = price;
+    return 'Цена сохранена.';
+  });
+});
+
+input.addEventListener('keydown', event => {
+  if (event.key === 'Enter') input.blur();
+});
+
 
     card.appendChild(body);
     frag.appendChild(card);
@@ -489,67 +515,290 @@ function exportPrices(){
   URL.revokeObjectURL(a.href);
 }
 
-function importPrices(file){
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const data = JSON.parse(reader.result);
-      if(typeof data !== 'object' || data === null || Array.isArray(data)) throw new Error('ожидается объект {название: цена}');
-      const valid = {};
-      for(const [k, v] of Object.entries(data)){
-        const n = Number(v);
-        if(cars.includes(k) && !isNaN(n)) valid[k] = n;
-      }
-      prices = valid; savePrices(); render();
-      alert(`Загружено ${Object.keys(valid).length} цен.`);
-    } catch(e){
-      alert('Не удалось прочитать файл: ' + e.message);
-    }
-  };
-  reader.readAsText(file);
+const PRICE_OWNER_UID = 'cc10fd10-7c65-4439-8c26-f9c17d882dec';
+const priceDb = window.supabase?.createClient(
+  'https://krvmmumfijkyskruvfzs.supabase.co',
+  'sb_publishable_a9lVLbsRnRn9gIrdTcLZPg_d9tNyF5t'
+);
+
+const knownCars = new Set(cars);
+let priceUser = null;
+let pricesLoaded = false;
+let priceBusy = false;
+
+const pricePanel = document.createElement('div');
+pricePanel.innerHTML = `
+  <details>
+    <summary>Вход для редактирования цен</summary>
+    <form>
+      <label>Почта <input name="email" type="email" autocomplete="username" required></label>
+      <label>Пароль <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Войти</button>
+    </form>
+    <button type="button" hidden>Выйти</button>
+  </details>
+  <p role="status"></p>
+`;
+grid.before(pricePanel);
+
+const priceForm = pricePanel.querySelector('form');
+const priceSignOut = pricePanel.querySelector('button[type="button"]');
+const priceStatus = pricePanel.querySelector('[role="status"]');
+
+function validPrice(n) {
+  return Number.isInteger(n) && n >= 0 && n <= 2147483647;
 }
 
-// ============ СОБЫТИЯ ============
-searchInput.addEventListener('input', debounce(render));
+function canEditPrices() {
+  return pricesLoaded && !priceBusy && priceUser?.id === PRICE_OWNER_UID;
+}
 
-sortBtn.addEventListener('click', () => {
-  sortMode = sortMode === 'none' ? 'asc' : sortMode === 'asc' ? 'desc' : 'none';
-  updateSortButton(); render();
-});
+function updatePriceControls() {
+  priceForm.hidden = !!priceUser;
+  priceForm.querySelector('button').disabled = priceBusy || !priceDb;
+  priceSignOut.hidden = !priceUser;
+  priceSignOut.disabled = priceBusy;
+  importBtn.disabled = !canEditPrices();
+  clearBtn.disabled = !canEditPrices();
+  exportBtn.disabled = !pricesLoaded || priceBusy;
+  grid.querySelectorAll('.price-input').forEach(input => {
+    input.readOnly = !canEditPrices();
+  });
+}
 
-pricedOnlyBtn.addEventListener('click', () => {
-  pricedOnly = !pricedOnly;
-  updatePricedOnlyButton(); render();
-});
+async function checkPriceRequest(request) {
+  const { data, error } = await request;
+  if (error) throw error;
+  return data;
+}
 
-exportBtn.addEventListener('click', exportPrices);
-importBtn.addEventListener('click', () => importFile.click());
-importFile.addEventListener('change', () => {
-  if(importFile.files[0]) importPrices(importFile.files[0]);
-  importFile.value = '';
-});
-
-clearPhotoCacheBtn.addEventListener('click', () => {
-  localStorage.removeItem(PHOTO_INDEX_KEY);
-  wikiPhotoMap.clear();
-  wikiIndexPromise = null;
-  render();
-  fetchWikiPhotoIndex().then(() => render());
-});
-
-clearBtn.addEventListener('click', () => {
-  const n = totalPriced();
-  if(n === 0){ alert('Нет цен для сброса.'); return; }
-  if(confirm(`Удалить все сохранённые цены (${n})? Это необратимо.`)){
-    prices = {}; savePrices(); render();
+async function loadCloudPrices() {
+  const loaded = Object.create(null);
+  for (let offset = 0; ; ) {
+    const rows = await checkPriceRequest(
+      priceDb.from('car_prices')
+        .select('car_id, price')
+        .order('car_id')
+        .range(offset, offset + 499)
+    );
+    if (!rows.length) break;
+    for (const { car_id, price } of rows) {
+      if (knownCars.has(car_id) && validPrice(price)) loaded[car_id] = price;
+    }
+    offset += rows.length;
   }
+  prices = loaded;
+  pricesLoaded = true;
+}
+
+async function runPriceAction(action) {
+  if (priceBusy) return;
+  priceBusy = true;
+  updatePriceControls();
+  priceStatus.textContent = 'Обращаюсь к базе цен…';
+
+  try {
+    priceStatus.textContent = await action();
+  } catch (error) {
+    priceStatus.textContent = 'Не удалось выполнить действие: ' + error.message;
+  } finally {
+    priceBusy = false;
+    updatePriceControls();
+    render();
+  }
+}
+
+priceForm.addEventListener('submit', event => {
+  event.preventDefault();
+  const email = priceForm.elements.namedItem('email').value.trim();
+  const passwordField = priceForm.elements.namedItem('password');
+  const password = passwordField.value;
+  passwordField.value = '';
+
+  runPriceAction(async () => {
+    const { user } = await checkPriceRequest(
+      priceDb.auth.signInWithPassword({ email, password })
+    );
+    priceUser = user;
+    await loadCloudPrices();
+    return user?.id === PRICE_OWNER_UID
+      ? 'Вход выполнен. Теперь можно менять цены.'
+      : 'У этого аккаунта нет права менять цены.';
+  });
 });
 
-// ============ ИНИЦИАЛИЗАЦИЯ ============
-updateSortButton();
-updatePricedOnlyButton();
-render();
-fetchWikiPhotoIndex().then(() => render());
-</script>
-</body>
-</html>
+priceSignOut.addEventListener('click', () => {
+  runPriceAction(async () => {
+    await checkPriceRequest(priceDb.auth.signOut());
+    priceUser = null;
+    return 'Выход выполнен. Цены доступны для просмотра.';
+  });
+});
+function updateSingleCard(payload) {
+  const carId = payload.new?.car_id || payload.old?.car_id;
+  const input = document.querySelector(`.price-input[data-car-id="${CSS.escape(carId)}"]`);
+  
+  if (input) {
+    const card = input.closest('.car-card');
+    // Если пользователь прямо сейчас печатает в это поле, мы не сбиваем его ввод
+    if (document.activeElement !== input) {
+      const newPrice = prices[carId];
+      input.value = newPrice !== undefined ? newPrice : '';
+      card.classList.toggle('priced', newPrice !== undefined);
+    }
+  }
+
+  // Обновляем счетчик "С ценой: X из Y" вверху страницы
+  const visibleCount = grid.querySelectorAll('.car-card').length;
+  countEl.textContent = `Показано: ${visibleCount} · С ценой: ${totalPriced()} из ${cars.length}`;
+}
+  
+async function saveImportedPrices(file) {
+  if (!canEditPrices()) return;
+  await runPriceAction(async () => {
+    const data = JSON.parse(await file.text());
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('нужен JSON-файл, созданный кнопкой «Экспорт цен»');
+    }
+
+    const rows = Object.entries(data)
+      .filter(([name, price]) => knownCars.has(name) && validPrice(price))
+      .map(([car_id, price]) => ({ car_id, price }));
+
+                             if (rows.length === 0) {
+                  throw new Error('В файле нет валидных цен для машин из базы.');
+                }
+
+                // Загружаем в Supabase (разбиваем на чанки по 100 штук для надежности)
+                const CHUNK_SIZE = 100;
+                for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+                  const chunk = rows.slice(i, i + CHUNK_SIZE);
+                  await checkPriceRequest(
+                    priceDb.from('car_prices').upsert(chunk, { onConflict: 'car_id' })
+                  );
+                }
+
+                // Обновляем локальные цены, чтобы интерфейс сразу их показал
+                for (const row of rows) {
+                  prices[row.car_id] = row.price;
+                }
+
+                return `Успешно импортировано ${rows.length} цен.`;
+              });
+            }
+
+            // ============ ОБРАБОТЧИКИ СОБЫТИЙ UI ============
+            
+            searchInput.addEventListener('input', debounce(render, 200));
+            
+            sortBtn.addEventListener('click', () => {
+              sortMode = sortMode === 'none' ? 'asc' : sortMode === 'asc' ? 'desc' : 'none';
+              updateSortButton();
+              render();
+            });
+
+            pricedOnlyBtn.addEventListener('click', () => {
+              pricedOnly = !pricedOnly;
+              updatePricedOnlyButton();
+              render();
+            });
+
+            exportBtn.addEventListener('click', exportPrices);
+
+            importBtn.addEventListener('click', () => {
+              if (canEditPrices()) importFile.click();
+            });
+
+            importFile.addEventListener('change', async () => {
+              const file = importFile.files[0];
+              if (!file) return;
+              await saveImportedPrices(file);
+              importFile.value = ''; // Сбрасываем, чтобы можно было выбрать тот же файл снова
+            });
+
+            clearBtn.addEventListener('click', () => {
+              if (!canEditPrices()) return;
+              if (!confirm('Вы уверены, что хотите удалить ВСЕ цены? Это действие необратимо.')) return;
+
+              runPriceAction(async () => {
+                // Удаляем все записи из таблицы
+                await checkPriceRequest(
+                  priceDb.from('car_prices').delete().neq('car_id', '') 
+                );
+                prices = {}; // Очищаем локальный объект
+                return 'Все цены успешно удалены.';
+              });
+            });
+
+            clearPhotoCacheBtn.addEventListener('click', () => {
+              localStorage.removeItem(PHOTO_INDEX_KEY);
+              wikiPhotoMap.clear();
+              wikiIndexPromise = null;
+              location.reload(); 
+            });
+
+            // ============ ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ ============
+
+            async function initApp() {
+              updateSortButton();
+              updatePricedOnlyButton();
+              priceBusy = true;
+              updatePriceControls();
+
+              try {
+                // Проверяем, есть ли активная сессия
+                const { data: { session } } = await priceDb.auth.getSession();
+                priceUser = session?.user || null;
+
+                // Загружаем цены из базы (доступно всем для просмотра)
+                await loadCloudPrices();
+                  // Включаем синхронизацию в реальном времени
+  priceDb.channel('price-sync-channel')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'car_prices' },
+      (payload) => {
+        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+          prices[payload.new.car_id] = payload.new.price;
+        } else if (payload.eventType === 'DELETE') {
+          delete prices[payload.old.car_id];
+        }
+        updateSingleCard(payload);
+      }
+    )
+    .subscribe();
+                priceStatus.textContent = priceUser
+                  ? (priceUser.id === PRICE_OWNER_UID ? 'Вход выполнен. Права на редактирование есть.' : 'Вход выполнен. Нет прав на редактирование.')
+                  : 'Войдите, чтобы редактировать цены.';
+
+              } catch (error) {
+                priceStatus.textContent = 'Ошибка инициализации: ' + error.message;
+              } finally {
+                priceBusy = false;
+                updatePriceControls();
+                render();
+              }
+            }
+
+            // Слушаем выход из аккаунта
+            priceDb.auth.onAuthStateChange((event) => {
+              if (event === 'SIGNED_OUT') {
+                priceUser = null;
+                updatePriceControls();
+                render();
+              }
+            });
+
+            // Запускаем приложение
+            initApp();
+
+            // Подгружаем фотографии из Wiki (асинхронно)
+            fetchWikiPhotoIndex().then(() => {
+              // Перерисовываем карточки, когда фото загрузятся, чтобы они заменили заглушки
+              render();
+            });
+
+            </script>
+            </body>
+            </html>
+      
