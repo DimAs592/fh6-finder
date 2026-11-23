@@ -299,6 +299,19 @@ totalCarsEl.textContent = cars.length;
 function getPrice(name){ return Object.prototype.hasOwnProperty.call(prices,name) ? prices[name] : null; }
 function totalPriced(){ return Object.keys(prices).length; }
 function parseCar(name){ const m=name.match(/^(\d{3,4})\s+(.*)$/); return {year:m?m[1]:'',title:m?m[2]:name}; }
+// Функция для красивого отображения (ставит точки)
+function formatPrice(val) {
+  if (val === null || val === undefined || val === '') return '';
+  const numStr = String(val).replace(/\D/g, ''); // Оставляем только цифры
+  return numStr.replace(/\B(?=(\d{3})+(?!\d))/g, '.'); // Ставим точки
+}
+
+// Функция для извлечения чистого числа (убирает точки)
+function parsePrice(val) {
+  if (!val) return null;
+  const num = parseInt(String(val).replace(/\D/g, ''), 10);
+  return isNaN(num) ? null : num;
+}
 function escapeHtml(s){ return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 const debounce=(fn,ms=120)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}};
 
@@ -454,45 +467,59 @@ function render(){
       <div class="car-name">${escapeHtml(title)}</div>
       <div class="price-row">
         <span class="price-label">Цена:</span>
-        <input type="number" inputmode="numeric" min="0" step="1"
+               <input type="text" inputmode="numeric"
                class="price-input" placeholder="не указана"
-               value="${price !== null ? price : ''}">
+               value="${price !== null ? formatPrice(price) : ''}">
       </div>
     `;
    const input = body.querySelector('.price-input');
     input.dataset.carId = name;
     input.readOnly = !canEditPrices();
 
-input.addEventListener('change', () => {
-  if (!canEditPrices()) return;
+   // 1. Автоматически ставим точки прямо во время ввода
+   input.addEventListener('input', (e) => {
+     if (!canEditPrices()) return;
+     e.target.value = formatPrice(e.target.value);
+   });
 
-  const value = input.value;
-  if (input.validity.badInput || (value !== '' && !validPrice(Number(value)))) {
-    input.value = getPrice(name) ?? '';
-    alert('Введи целую неотрицательную цену до 2 147 483 647.');
-    return;
-  }
+   // 2. Сохраняем цену при нажатии Enter или клике в сторону
+   input.addEventListener('change', () => {
+     if (!canEditPrices()) return;
 
-  runPriceAction(async () => {
-    if (value === '') {
-      await checkPriceRequest(
-        priceDb.from('car_prices').delete().eq('car_id', name)
-      );
-      delete prices[name];
-      return 'Цена удалена.';
-    }
+     const rawValue = input.value;
+     const price = parsePrice(rawValue); // Достаем чистое число (без точек)
 
-    const price = Number(value);
-    await checkPriceRequest(
-      priceDb.from('car_prices').upsert(
-        { car_id: name, price },
-        { onConflict: 'car_id' }
-      )
-    );
-    prices[name] = price;
-    return 'Цена сохранена.';
-  });
-});
+     // Если поле пустое - удаляем цену из базы
+     if (rawValue === '') {
+       runPriceAction(async () => {
+         await checkPriceRequest(
+           priceDb.from('car_prices').delete().eq('car_id', name)
+         );
+         delete prices[name];
+         return 'Цена удалена.';
+       });
+       return;
+     }
+
+     // Если ввели ерунду или число больше 2 147 483 647
+     if (price === null || !validPrice(price)) {
+       input.value = formatPrice(getPrice(name) ?? '');
+       alert('Введи целую неотрицательную цену до 2 147 483 647.');
+       return;
+     }
+
+     // Сохраняем в базу
+     runPriceAction(async () => {
+       await checkPriceRequest(
+         priceDb.from('car_prices').upsert(
+           { car_id: name, price },
+           { onConflict: 'car_id' }
+         )
+       );
+       prices[name] = price;
+       return 'Цена сохранена.';
+     });
+   });
 
 input.addEventListener('keydown', event => {
   if (event.key === 'Enter') input.blur();
@@ -643,7 +670,7 @@ function updateSingleCard(payload) {
     // Если пользователь прямо сейчас печатает в это поле, мы не сбиваем его ввод
     if (document.activeElement !== input) {
       const newPrice = prices[carId];
-      input.value = newPrice !== undefined ? newPrice : '';
+      input.value = newPrice !== undefined ? formatPrice(newPrice) : '';
       card.classList.toggle('priced', newPrice !== undefined);
     }
   }
